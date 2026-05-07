@@ -1,3 +1,5 @@
+## Sensitivity analysis of parameters
+
 """
 Image Registration & Stitching — Monje Lab
 ================================================
