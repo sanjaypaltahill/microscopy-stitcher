@@ -1,9 +1,29 @@
 """
+<<<<<<< Updated upstream
 Automatic 3D Image Stitching — Monje Lab
 ========================================
 Detects tile grid, channels, and Z slices from OME-TIFF filenames,
 stitches each Z slice into a 2D image per channel, and saves individually.
 Filename suffix format expected: ...[RR x CC]_C<ch>_z<zzzz>.ome.tif
+=======
+stitching.py — Monje Lab Stitcher
+===================================
+Row, column, and full-slice stitching.
+
+Changes vs previous version
+-----------------------------
+* global_thresh / binary masking removed throughout.
+  Background subtraction is now handled inside registration.py before PCC;
+  stitching.py never needs to touch the threshold.
+
+* max_shift_frac forwarded to estimate_shift_* so the shift constraint is
+  respected consistently.
+
+* bg_percentile forwarded so callers can tune background subtraction.
+
+* overlap_px is passed through from the shift estimators unchanged (no
+  overlap-search); the blend zone always uses the nominal overlap.
+>>>>>>> Stashed changes
 """
 
 import os
@@ -11,6 +31,7 @@ import sys
 import re
 import argparse
 import numpy as np
+<<<<<<< Updated upstream
 
 try:
     from PIL import Image
@@ -23,6 +44,20 @@ try:
 except ImportError:
     USE_TIFFFILE = False
     print("tifffile not found; falling back to Pillow.")
+=======
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional
+
+from io_utils import load_tile
+from blending import stitch_pair
+from registration import (
+    estimate_shift_horizontal,
+    estimate_shift_vertical,
+    apply_shift_skimage,
+    compute_mse,
+    compute_mutual_information,
+)
+>>>>>>> Stashed changes
 
 
 # -------------------
@@ -33,6 +68,7 @@ def blend_weighted_x(left_ol, right_ol):
     ramp = np.linspace(1.0, 0.0, n, dtype=np.float32)[None, :]
     return ramp * left_ol + (1.0 - ramp) * right_ol
 
+<<<<<<< Updated upstream
 
 def blend_weighted_y(top_ol, bot_ol):
     n = top_ol.shape[0]
@@ -273,3 +309,357 @@ def main():
 
 if __name__ == "__main__":
     main()
+=======
+@dataclass
+class ShiftPlan:
+    # (row, col) → (dy, dx, overlap_px)
+    h_shifts: Dict[Tuple[int, int], Tuple[float, float, int]] = field(default_factory=dict)
+    # row_idx → (dy, dx, overlap_px)
+    v_shifts: Dict[int, Tuple[float, float, int]]             = field(default_factory=dict)
+
+
+# ─────────────────────────────────────────────
+#  OVERLAP STAT RECORD
+# ─────────────────────────────────────────────
+
+@dataclass
+class OverlapStat:
+    pair:       str
+    mse_before: float = 0.0
+    mse_after:  float = 0.0
+    mi_before:  float = 0.0
+    mi_after:   float = 0.0
+
+
+def _pct_change(before: float, after: float, invert: bool = False) -> str:
+    if before == 0.0:
+        return "     N/A"
+    if invert:
+        pct = (after - before) / before * 100.0
+    else:
+        pct = (before - after) / before * 100.0
+    sign = "+" if pct >= 0 else ""
+    return f"{sign}{pct:7.1f}%"
+
+
+def print_stats_table(stats: List[OverlapStat]) -> None:
+    col_w = 105
+    print("\n" + "=" * col_w)
+    print("  ALIGNMENT STATISTICS")
+    print("  MSE = mean-squared pixel error in the overlap zone  (lower = better)")
+    print("  MI  = mutual information in the overlap zone        (higher = better)")
+    print("=" * col_w)
+    header = (
+        f"  {'Pair':<28}  "
+        f"{'MSE before':>11}  {'MSE after':>11}  {'MSE % chg':>10}  "
+        f"{'MI before':>9}  {'MI after':>9}  {'MI % chg':>9}"
+    )
+    print(header)
+    print("  " + "-" * (col_w - 2))
+    for s in stats:
+        print(
+            f"  {s.pair:<28}  "
+            f"{s.mse_before:>11.1f}  {s.mse_after:>11.1f}  "
+            f"{_pct_change(s.mse_before, s.mse_after):>10}  "
+            f"{s.mi_before:>9.4f}  {s.mi_after:>9.4f}  "
+            f"{_pct_change(s.mi_before, s.mi_after, invert=True):>9}"
+        )
+    print("=" * col_w + "\n")
+
+
+# ─────────────────────────────────────────────
+#  SHIFT COMPUTATION
+# ─────────────────────────────────────────────
+
+def compute_shifts(tiles, z, ref_ch, n_rows, n_cols,
+                   overlap_x, overlap_y,
+                   fudge=0, upsample=10, max_shift=500,
+                   multiscale=True,
+                   bg_percentile=5,
+                   max_shift_frac=0.5,
+                   # legacy kwarg accepted but ignored
+                   global_thresh=None,
+                   mask_dir=None):
+    """
+    Compute horizontal and vertical shifts for all tile pairs.
+
+    Horizontal: pairwise (r, c-1) → (r, c)  for each row.
+    Vertical:   pairwise (r-1, c) → (r, c)  per column, then median
+                across all columns as the consensus for that row pair.
+
+    Returns ShiftPlan.
+    """
+    plan = ShiftPlan()
+    print(f"\n  Computing shifts on ref_ch={ref_ch}, z={z} …")
+
+    # ── Horizontal passes ─────────────────────────────────────────
+    print("\n  -- Horizontal passes --")
+    for r in range(n_rows):
+        for c in range(1, n_cols):
+            path_a = tiles.get((r, c - 1, z, ref_ch))
+            path_b = tiles.get((r, c,     z, ref_ch))
+            if path_a is None or path_b is None:
+                plan.h_shifts[(r, c)] = (0.0, 0.0, overlap_x)
+                print(f"    ({r},{c-1})→({r},{c}): MISSING — using (0, 0, {overlap_x})")
+                continue
+
+            img_a = load_tile(path_a)
+            img_b = load_tile(path_b)
+
+            print(f"    H ({r},{c-1})→({r},{c})")
+            dy, dx, ov = estimate_shift_horizontal(
+                img_a, img_b, overlap_x,
+                fudge=fudge, upsample=upsample,
+                max_shift=max_shift, multiscale=multiscale,
+                bg_percentile=bg_percentile,
+                max_shift_frac=max_shift_frac,
+            )
+            plan.h_shifts[(r, c)] = (dy, dx, ov)
+
+    # ── Vertical passes (per-column tile pairs, then median) ──────
+    print("\n  -- Vertical passes (per-column tile pairs) --")
+    for r in range(1, n_rows):
+        col_dys = []
+        col_dxs = []
+        col_ovs = []
+
+        for c in range(n_cols):
+            path_a = tiles.get((r - 1, c, z, ref_ch))
+            path_b = tiles.get((r,     c, z, ref_ch))
+            if path_a is None or path_b is None:
+                print(f"    V ({r-1},{c})→({r},{c}): MISSING — skipping column")
+                continue
+
+            img_a = load_tile(path_a)
+            img_b = load_tile(path_b)
+
+            print(f"    V ({r-1},{c})→({r},{c})")
+            dy, dx, ov = estimate_shift_vertical(
+                img_a, img_b, overlap_y,
+                fudge=fudge, upsample=upsample,
+                max_shift=max_shift, multiscale=multiscale,
+                bg_percentile=bg_percentile,
+                max_shift_frac=max_shift_frac,
+            )
+            col_dys.append(dy)
+            col_dxs.append(dx)
+            col_ovs.append(ov)
+
+        if col_dys:
+            med_dy = float(np.median(col_dys))
+            med_dx = float(np.median(col_dxs))
+            med_ov = int(round(np.median(col_ovs)))
+            print(f"    V row {r-1}→{r}: median dy={med_dy:+.2f}  dx={med_dx:+.2f}  "
+                  f"overlap={med_ov}px  "
+                  f"(from {len(col_dys)} columns: "
+                  f"dy={[round(v,1) for v in col_dys]}, "
+                  f"dx={[round(v,1) for v in col_dxs]})")
+            plan.v_shifts[r] = (med_dy, med_dx, med_ov)
+        else:
+            plan.v_shifts[r] = (0.0, 0.0, overlap_y)
+            print(f"    V row {r-1}→{r}: no valid columns — using (0, 0, {overlap_y})")
+
+    return plan
+
+
+# ─────────────────────────────────────────────
+#  HELPERS
+# ─────────────────────────────────────────────
+
+def _pad_horizontal_for_shift(accum, incoming, dx):
+    if abs(dx) < 0.5:
+        return accum, incoming
+    abs_d = int(round(abs(dx)))
+    if dx > 0:
+        accum    = np.pad(accum,    ((0, 0), (0, abs_d)), constant_values=0)
+        incoming = np.pad(incoming, ((0, 0), (abs_d, 0)), constant_values=0)
+    else:
+        accum    = np.pad(accum,    ((0, 0), (abs_d, 0)), constant_values=0)
+        incoming = np.pad(incoming, ((0, 0), (0, abs_d)), constant_values=0)
+    return accum, incoming
+
+
+def _pad_vertical_for_shift(accum, incoming, dy):
+    if abs(dy) < 0.5:
+        return accum, incoming
+    abs_d = int(round(abs(dy)))
+    if dy > 0:
+        accum    = np.pad(accum,    ((0, abs_d), (0, 0)), constant_values=0)
+        incoming = np.pad(incoming, ((abs_d, 0), (0, 0)), constant_values=0)
+    else:
+        accum    = np.pad(accum,    ((abs_d, 0), (0, 0)), constant_values=0)
+        incoming = np.pad(incoming, ((0, abs_d), (0, 0)), constant_values=0)
+    return accum, incoming
+
+
+def _align_for_stitch(accum, incoming, dy, dx, axis):
+    if axis == "h":
+        return _pad_vertical_for_shift(accum, incoming, dy)
+    if axis == "v":
+        return _pad_horizontal_for_shift(accum, incoming, dx)
+    raise ValueError(f"axis must be 'h' or 'v', got {axis!r}")
+
+
+def _apply_row_shifts(tiles, z, ch, row_idx, n_cols, overlap_x, plan, blend):
+    path = tiles.get((row_idx, 0, z, ch))
+    if path is None:
+        raise ValueError(f"Missing tile ({row_idx}, 0, z={z}, ch={ch})")
+
+    accum = load_tile(path)
+    for c in range(1, n_cols):
+        path_b = tiles.get((row_idx, c, z, ch))
+        if path_b is None:
+            continue
+        incoming = load_tile(path_b)
+        dy, dx, ov = plan.h_shifts.get((row_idx, c), (0.0, 0.0, overlap_x))
+
+        accum, incoming = _align_for_stitch(accum, incoming, dy, dx, axis="h")
+        accum = stitch_pair(accum, incoming, ov, axis="h", blend=blend)
+    return accum
+
+
+# ─────────────────────────────────────────────
+#  METRIC HELPERS
+# ─────────────────────────────────────────────
+
+def _metrics_for_offset(img_a, img_b, offset_y, offset_x):
+    yb = int(round(offset_y))
+    xb = int(round(offset_x))
+    y0 = max(0, yb);  y1 = min(img_a.shape[0], yb + img_b.shape[0])
+    x0 = max(0, xb);  x1 = min(img_a.shape[1], xb + img_b.shape[1])
+    if y1 <= y0 or x1 <= x0:
+        return 0.0, 0.0
+    sa = img_a[y0:y1, x0:x1].astype(np.float64)
+    sb = img_b[y0 - yb:y1 - yb, x0 - xb:x1 - xb].astype(np.float64)
+    mse = float(np.mean(np.square(sa - sb)))
+    mi  = compute_mutual_information(sa.astype(np.float32), sb.astype(np.float32))
+    return mse, mi
+
+
+def _metrics_naive_h(img_a, img_b, overlap_x):
+    return _metrics_for_offset(img_a, img_b, 0.0, img_a.shape[1] - overlap_x)
+
+
+def _metrics_registered_h(img_a, img_b, dy, dx, overlap_x):
+    return _metrics_for_offset(img_a, img_b, dy, img_a.shape[1] - overlap_x + dx)
+
+
+def _metrics_naive_v(row_a, row_b, overlap_y):
+    return _metrics_for_offset(row_a, row_b, row_a.shape[0] - overlap_y, 0.0)
+
+
+def _metrics_registered_v(row_a, row_b, dy, dx, overlap_y):
+    return _metrics_for_offset(row_a, row_b, row_a.shape[0] - overlap_y + dy, dx)
+
+
+# ─────────────────────────────────────────────
+#  STAT CREATION
+# ─────────────────────────────────────────────
+
+def _overlap_stat_h(img_a, img_b, overlap_x, dy, dx, ov, r, c):
+    mse_before, mi_before = _metrics_naive_h(img_a, img_b, overlap_x)
+    mse_after,  mi_after  = _metrics_registered_h(img_a, img_b, dy, dx, ov)
+    return OverlapStat(
+        pair=f"H r{r} c{c-1}-{c}",
+        mse_before=mse_before, mse_after=mse_after,
+        mi_before=mi_before,   mi_after=mi_after,
+    )
+
+
+def _overlap_stat_v(row_a, row_b, overlap_y, dy, dx, ov, r):
+    mse_before, mi_before = _metrics_naive_v(row_a, row_b, overlap_y)
+    mse_after,  mi_after  = _metrics_registered_v(row_a, row_b, dy, dx, ov)
+    return OverlapStat(
+        pair=f"V rows {r-1}-{r} (full rows)",
+        mse_before=mse_before, mse_after=mse_after,
+        mi_before=mi_before,   mi_after=mi_after,
+    )
+
+
+# ─────────────────────────────────────────────
+#  FULL-SLICE STITCHING
+# ─────────────────────────────────────────────
+
+def stitch_full_slice(tiles, z, ch, n_rows, n_cols,
+                      overlap_x, overlap_y, plan, blend="average",
+                      tile_h=None, tile_w=None, collect_stats=False,
+                      # legacy kwargs accepted but ignored
+                      global_thresh=None, mask_dir=None):
+    stats: List[OverlapStat] = []
+
+    print(f"\n  Building rows for ch={ch}, z={z} …")
+    row_images = []
+    for r in range(n_rows):
+        row_img = _apply_row_shifts(tiles, z, ch, r, n_cols, overlap_x, plan, blend)
+        row_images.append(row_img)
+
+        if collect_stats and tile_h is not None and tile_w is not None:
+            for c in range(1, n_cols):
+                path_a = tiles.get((r, c-1, z, ch))
+                path_b = tiles.get((r, c,   z, ch))
+                if path_a is None or path_b is None:
+                    continue
+                img_a = load_tile(path_a)
+                img_b = load_tile(path_b)
+                dy, dx, ov = plan.h_shifts.get((r, c), (0.0, 0.0, overlap_x))
+                stats.append(_overlap_stat_h(img_a, img_b, overlap_x, dy, dx, ov, r, c))
+
+    print(f"\n  Stacking rows for ch={ch}, z={z} …")
+    canvas = row_images[0]
+    for r in range(1, n_rows):
+        incoming = row_images[r]
+        dy, dx, ov = plan.v_shifts.get(r, (0.0, 0.0, overlap_y))
+
+        if collect_stats:
+            stats.append(_overlap_stat_v(canvas, incoming, overlap_y, dy, dx, ov, r))
+
+        canvas, incoming = _align_for_stitch(canvas, incoming, dy, dx, axis="v")
+        canvas = stitch_pair(canvas, incoming, ov, axis="v", blend=blend)
+
+    return canvas, stats
+
+
+# ─────────────────────────────────────────────
+#  NAIVE FULL-SLICE STITCHING
+# ─────────────────────────────────────────────
+
+def stitch_full_slice_naive(tiles, z, ch, n_rows, n_cols,
+                            overlap_x, overlap_y, blend="average",
+                            tile_h=None, tile_w=None,
+                            collect_stats=False,
+                            # legacy kwargs accepted but ignored
+                            global_thresh=None, mask_dir=None):
+    stats: List[OverlapStat] = []
+
+    print(f"\n  Building rows (NAIVE) for ch={ch}, z={z} …")
+    row_images = []
+    for r in range(n_rows):
+        accum = load_tile(tiles[(r, 0, z, ch)])
+        for c in range(1, n_cols):
+            incoming = load_tile(tiles[(r, c, z, ch)])
+            if collect_stats:
+                left_tile = load_tile(tiles[(r, c - 1, z, ch)])
+                mse, mi = _metrics_naive_h(left_tile, incoming, overlap_x)
+                stats.append(OverlapStat(
+                    pair=f"H r{r} c{c-1}-{c}",
+                    mse_before=mse, mse_after=mse,
+                    mi_before=mi,   mi_after=mi,
+                ))
+            accum = stitch_pair(accum, incoming, overlap_x, axis="h", blend=blend)
+        row_images.append(accum)
+
+    print(f"\n  Stacking rows (NAIVE) for ch={ch}, z={z} …")
+    canvas = row_images[0]
+    for r in range(1, n_rows):
+        incoming = row_images[r]
+        if collect_stats:
+            mse, mi = _metrics_naive_v(row_images[r - 1], row_images[r], overlap_y)
+            stats.append(OverlapStat(
+                pair=f"V rows {r-1}-{r} (full rows)",
+                mse_before=mse, mse_after=mse,
+                mi_before=mi,   mi_after=mi,
+            ))
+        canvas = stitch_pair(canvas, incoming, overlap_y, axis="v", blend=blend)
+
+    return canvas, stats
+>>>>>>> Stashed changes

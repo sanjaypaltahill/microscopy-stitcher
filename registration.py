@@ -1,6 +1,7 @@
 ## Sensitivity analysis of parameters
 
 """
+<<<<<<< Updated upstream
 Image Registration & Stitching — Monje Lab
 ================================================
 Uses skimage.registration.phase_cross_correlation to estimate the best
@@ -35,6 +36,53 @@ New flags:
 
 Dependencies:
     pip install numpy tifffile scipy scikit-image Pillow matplotlib
+=======
+registration.py — Monje Lab Stitcher
+======================================
+Phase-cross-correlation (PCC) shift estimation with continuous background
+subtraction (no binary masks) and a tile-fraction shift constraint.
+
+Design decisions
+-----------------
+* PCC on overlap strips (not full tiles):
+  For a horizontal join, PCC operates on the right-edge strip of tile A and
+  the left-edge strip of tile B, each overlap_px wide.  For a vertical join,
+  the bottom strip of A and top strip of B, each overlap_px tall.
+
+  Running PCC on the full tile is tempting but wrong: the dominant phase peak
+  would correspond to the strongest repeating spatial frequency in the tissue
+  (e.g. cell bodies at ~900 px spacing), not the seam offset.  Restricting to
+  the overlap strips keeps the correlation space small and physically
+  meaningful.
+
+* Background subtraction (not masking):
+  Before PCC, the per-strip percentile baseline is subtracted and negative
+  values are clipped to zero.  This suppresses camera offset and
+  autofluorescence continuously — no Otsu, no binary mask, no foreground
+  fg-overlap gate.
+
+* Shift constraint with peak-space fallback:
+  After PCC, the shift is accepted only if |dy| ≤ max_shift_frac × strip_h
+  and |dx| ≤ max_shift_frac × strip_w (and both ≤ max_shift).  If the
+  primary result fails, the phase-correlation surface is re-examined at
+  progressively coarser upsample factors (different peaks may dominate), then
+  via a downsampled coarse PCC.  If nothing passes the constraint, (0, 0) is
+  returned.
+
+Public API
+----------
+subtract_background(img, percentile=5)
+
+estimate_shift_horizontal(img_a, img_b, overlap_px, ..., max_shift_frac=0.5)
+    Returns (dy, dx, overlap_px).
+
+estimate_shift_vertical(img_a, img_b, overlap_px, ..., max_shift_frac=0.5)
+    Returns (dy, dx, overlap_px).
+
+compute_mse(img_a, img_b)
+compute_mutual_information(img_a, img_b, bins=64)
+apply_shift_skimage(img, dy, dx, output_shape)
+>>>>>>> Stashed changes
 """
 
 import os
@@ -46,6 +94,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+<<<<<<< Updated upstream
 import matplotlib.patches as mpatches
 
 try:
@@ -76,6 +125,43 @@ def parse_filename(fname):
     prefix = m.group(1).rstrip("_ ") or "registered"
     row, col, ch, z = map(int, m.groups()[1:])
     return row, col, ch, z, prefix
+=======
+import os
+
+from skimage.registration import phase_cross_correlation
+from skimage.transform import AffineTransform, warp, rescale
+from io_utils import load_tile
+
+
+# ─────────────────────────────────────────────
+#  BACKGROUND SUBTRACTION
+# ─────────────────────────────────────────────
+
+def subtract_background(img: np.ndarray, percentile: float = 5) -> np.ndarray:
+    """
+    Subtract the *percentile*-th percentile pixel value from the array and
+    clip negatives to zero.  Returns float32.
+    """
+    baseline = float(np.percentile(img, percentile))
+    return np.clip(img - baseline, 0.0, None).astype(np.float32)
+
+
+# ─────────────────────────────────────────────
+#  INTERNAL PCC WRAPPER
+# ─────────────────────────────────────────────
+
+def _pcc(ref: np.ndarray, moving: np.ndarray, upsample: int):
+    """
+    phase_cross_correlation(normalization=None).
+    Crops to common shape if needed.
+    Returns (dy, dx, error).
+    """
+    if ref.shape != moving.shape:
+        rows = min(ref.shape[0], moving.shape[0])
+        cols = min(ref.shape[1], moving.shape[1])
+        ref    = ref[:rows, :cols]
+        moving = moving[:rows, :cols]
+>>>>>>> Stashed changes
 
 
 # ============================================================
@@ -183,6 +269,7 @@ def estimate_shift_vertical(img_a, img_b, overlap_px, search_margin=100, upsampl
             upsample_factor=upsample,
             normalization="phase",
         )
+<<<<<<< Updated upstream
     
     dy = float(shift[0])
     dx = float(shift[1])
@@ -202,6 +289,169 @@ def apply_shift_skimage(img, dy, dx, output_shape):
     Pure translation -- no rotation, no shear.
     skimage convention: translation=(x, y) = (col, row).
     """
+=======
+    return float(shift[0]), float(shift[1]), float(error)
+
+
+# ─────────────────────────────────────────────
+#  SHIFT CONSTRAINT + FALLBACK
+# ─────────────────────────────────────────────
+
+def _pcc_with_shift_limit(ref: np.ndarray, moving: np.ndarray,
+                          max_dy: float, max_dx: float,
+                          upsample: int,
+                          label: str = "") -> tuple:
+    """
+    Run PCC and return the first result whose shift is within bounds.
+
+    Fallback sequence
+    -----------------
+    1. PCC at requested upsample.
+    2. PCC at upsample//2, upsample//4, 1  (different peak may dominate).
+    3. Coarse downsampled (1/8) PCC, result scaled back up.
+    4. If nothing passes → warn and return (0.0, 0.0, 1.0).
+
+    Note: changing upsample does NOT change which phase peak is the global
+    maximum — it only changes sub-pixel resolution.  Steps 1-3 therefore all
+    find the same integer-pixel peak; the real purpose of the fallback chain
+    is step 3 (coarse scale), which physically cannot produce a large shift
+    because the image is small.  Steps 1-2 are kept for the sub-pixel
+    accuracy ladder in the normal in-range case.
+
+    Returns
+    -------
+    dy, dx, error : float, float, float
+    """
+    for up in [upsample, max(1, upsample // 2), max(1, upsample // 4), 1]:
+        dy, dx, error = _pcc(ref, moving, up)
+        if abs(dy) <= max_dy and abs(dx) <= max_dx:
+            if up != upsample:
+                print(f"    [{label}] accepted at upsample={up}: "
+                      f"dy={dy:+.2f}, dx={dx:+.2f}")
+            return dy, dx, error
+
+    # Coarse downsampled fallback — operates at 1/8 resolution, so the
+    # maximum possible shift in full-res pixels is strip_dim/8 * 8 = strip_dim,
+    # but in practice the coarse result is usually small and within bounds.
+    scale = 8
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ref_d = rescale(ref,    1.0 / scale, anti_aliasing=True)
+        mov_d = rescale(moving, 1.0 / scale, anti_aliasing=True)
+    dy_c, dx_c, error = _pcc(ref_d, mov_d, 1)
+    dy = dy_c * scale
+    dx = dx_c * scale
+    if abs(dy) <= max_dy and abs(dx) <= max_dx:
+        print(f"    [{label}] coarse fallback accepted: "
+              f"dy={dy:+.2f}, dx={dx:+.2f}")
+        return dy, dx, error
+
+    print(
+        f"    WARNING [{label}]: all PCC attempts exceeded shift limit "
+        f"(max_dy={max_dy:.0f}px, max_dx={max_dx:.0f}px). "
+        f"Last coarse result: dy={dy:+.2f}, dx={dx:+.2f}. Using (0, 0)."
+    )
+    return 0.0, 0.0, 1.0
+
+
+# ─────────────────────────────────────────────
+#  PUBLIC SHIFT ESTIMATION
+# ─────────────────────────────────────────────
+
+def estimate_shift_horizontal(img_a, img_b, overlap_px,
+                               fudge=0, upsample=10, max_shift=500,
+                               multiscale=True,
+                               bg_percentile=5,
+                               max_shift_frac=0.5,
+                               # legacy kwargs accepted but unused
+                               global_thresh=None,
+                               min_overlap_frac=None,
+                               max_overlap_frac=None):
+    """
+    Estimate (dy, dx, overlap_px) to align tile B to the right of tile A.
+
+    PCC is run on the right overlap_px columns of img_a vs the left
+    overlap_px columns of img_b, after per-strip background subtraction.
+
+    The shift constraint is max_shift_frac × strip dimension (and ≤ max_shift).
+
+    Returns
+    -------
+    dy, dx, overlap_px : float, float, int
+        overlap_px is passed through unchanged.
+    """
+    h_a, w_a = img_a.shape
+    h_b, w_b = img_b.shape
+    rows = min(h_a, h_b)
+    ov   = min(overlap_px, w_a, w_b)
+
+    # Extract overlap strips
+    strip_a = img_a[:rows, -ov:]   # right edge of A
+    strip_b = img_b[:rows,  :ov]   # left  edge of B
+
+    # Background-subtract each strip independently
+    ref    = subtract_background(strip_a, bg_percentile)
+    moving = subtract_background(strip_b, bg_percentile)
+
+    # Shift bounds: fraction of strip dimensions
+    max_dy = min(max_shift, max_shift_frac * rows)
+    max_dx = min(max_shift, max_shift_frac * ov)
+
+    dy, dx, error = _pcc_with_shift_limit(
+        ref, moving, max_dy, max_dx, upsample, label="horizontal"
+    )
+    print(f"    PCC horizontal: dy={dy:+.2f}, dx={dx:+.2f}, error={error:.4f}  "
+          f"(strip {rows}×{ov}px, max_dy={max_dy:.0f}, max_dx={max_dx:.0f})")
+    return dy, dx, overlap_px
+
+
+def estimate_shift_vertical(img_a, img_b, overlap_px,
+                             fudge=0, upsample=10, max_shift=500,
+                             multiscale=True,
+                             bg_percentile=5,
+                             max_shift_frac=0.5,
+                             # legacy kwargs accepted but unused
+                             global_thresh=None,
+                             min_overlap_frac=None,
+                             max_overlap_frac=None):
+    """
+    Estimate (dy, dx, overlap_px) to align tile B below tile A.
+
+    PCC is run on the bottom overlap_px rows of img_a vs the top
+    overlap_px rows of img_b, after per-strip background subtraction.
+
+    Returns
+    -------
+    dy, dx, overlap_px : float, float, int
+    """
+    h_a, w_a = img_a.shape
+    h_b, w_b = img_b.shape
+    cols = min(w_a, w_b)
+    ov   = min(overlap_px, h_a, h_b)
+
+    strip_a = img_a[-ov:, :cols]   # bottom edge of A
+    strip_b = img_b[ :ov, :cols]   # top    edge of B
+
+    ref    = subtract_background(strip_a, bg_percentile)
+    moving = subtract_background(strip_b, bg_percentile)
+
+    max_dy = min(max_shift, max_shift_frac * ov)
+    max_dx = min(max_shift, max_shift_frac * cols)
+
+    dy, dx, error = _pcc_with_shift_limit(
+        ref, moving, max_dy, max_dx, upsample, label="vertical"
+    )
+    print(f"    PCC vertical:   dy={dy:+.2f}, dx={dx:+.2f}, error={error:.4f}  "
+          f"(strip {ov}×{cols}px, max_dy={max_dy:.0f}, max_dx={max_dx:.0f})")
+    return dy, dx, overlap_px
+
+
+# ─────────────────────────────────────────────
+#  WARP  (test_mode diagnostics only)
+# ─────────────────────────────────────────────
+
+def apply_shift_skimage(img, dy, dx, output_shape):
+>>>>>>> Stashed changes
     tform = AffineTransform(translation=(dx, dy))
     warped = warp(
         img,
@@ -215,6 +465,7 @@ def apply_shift_skimage(img, dy, dx, output_shape):
     return warped.astype(np.float32)
 
 
+<<<<<<< Updated upstream
 # ============================================================
 #  MOVEMENT REPORT
 # ============================================================
@@ -1088,3 +1339,49 @@ Examples
 
 if __name__ == "__main__":
     main()
+=======
+# ─────────────────────────────────────────────
+#  DIAGNOSTIC HELPERS
+# ─────────────────────────────────────────────
+
+def compute_mse(img_a, img_b):
+    if img_a.shape != img_b.shape:
+        raise ValueError(
+            f"compute_mse: shape mismatch {img_a.shape} vs {img_b.shape}"
+        )
+    return float(np.mean(np.square(img_a.astype(np.float64)
+                                   - img_b.astype(np.float64))))
+
+
+def compute_mutual_information(img_a, img_b, bins=64):
+    a = img_a.ravel().astype(np.float64)
+    b = img_b.ravel().astype(np.float64)
+    n = min(len(a), len(b))
+    a, b = a[:n], b[:n]
+    hist_ab, _, _ = np.histogram2d(a, b, bins=bins)
+    hist_ab = hist_ab + 1e-12
+    p_ab = hist_ab / hist_ab.sum()
+    p_a  = p_ab.sum(axis=1, keepdims=True)
+    p_b  = p_ab.sum(axis=0, keepdims=True)
+    mi = float(np.sum(p_ab * np.log2(p_ab / (p_a * p_b))))
+    return max(mi, 0.0)
+
+
+# ─────────────────────────────────────────────
+#  LEGACY STUBS
+# ─────────────────────────────────────────────
+
+def compute_global_threshold(tiles, sample_frac=0.10, n_bins=512):
+    """Removed: background subtraction replaces binary masking."""
+    return None
+
+
+def compute_foreground_mask(strip, global_thresh=None):
+    """Removed: use subtract_background instead."""
+    return np.ones(strip.shape, dtype=bool)
+
+
+def save_mask_png(img, mask, out_path):
+    """Removed: mask PNGs are no longer produced."""
+    pass
+>>>>>>> Stashed changes
