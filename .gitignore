@@ -2,6 +2,9 @@
 .DS_Store
 .Trashes
 
+# stitching outputs
+stitch_output/
+
 # Jupyter Notebook
 .ipynb_checkpoints
 
