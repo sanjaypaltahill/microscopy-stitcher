@@ -4,6 +4,11 @@
 
 # stitching outputs
 stitch_output/
+*_percentile_QC/
+
+# slurm job output (keep the directory, drop the logs)
+slurm_logs/*
+!slurm_logs/.gitkeep
 
 # Jupyter Notebook
 .ipynb_checkpoints

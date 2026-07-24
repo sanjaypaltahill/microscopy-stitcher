@@ -11,7 +11,7 @@ It auto-detects the stem, grid size, channels and z-slices. For every z-slice it
 registers the REFERENCE channel (default C00), remembers the per-tile shifts, and
 applies those SAME shifts to the other channels' matching z-slice -- so all
 channels stay pixel-aligned. Each channel's registered mosaics are written to its
-own "Channel <ch> stitched" folder.
+own "Channel_<ch>_stitched" folder.
 
 Run with the project python, e.g.:
     /opt/miniconda3/bin/python registration.py "/Users/spaltahill/test_images"
@@ -35,7 +35,11 @@ from scipy.ndimage import gaussian_filter
 # -- Core helpers (from basic_horizontal) --------------------------
 
 def load_tile(path):
-    img = tifffile.imread(str(path)).astype('float32')
+    # is_ome=False: read ONLY this file's pixels. These are OME-TIFFs whose
+    # OME-XML describes the whole multi-file acquisition, so a plain imread would
+    # try to assemble every tile/z (hundreds of GB) into RAM and OOM. We want
+    # just this one plane.
+    img = tifffile.imread(str(path), is_ome=False).astype('float32')
     while img.ndim > 2:
         img = img[0]
     return img
@@ -89,7 +93,7 @@ def _parabolic_subpx(corr, py, px):
 
 
 def register_pcc_constrained(strip_a, strip_b, highpass_sigma, window,
-                             max_cross, join_center, join_half, axis):
+                             max_cross, join_center, join_half, axis, excl_px=5):
     """Phase correlation that takes the best peak WITHIN A PLAUSIBLE WINDOW instead
     of the global peak. Same normalized cross-power spectrum as `register_pcc`
     (verified to reproduce skimage's shift on well-conditioned pairs), but the
@@ -101,7 +105,15 @@ def register_pcc_constrained(strip_a, strip_b, highpass_sigma, window,
 
     A spurious global peak (e.g. PCC sliding along a diagonal edge to dy=+65) falls
     OUTSIDE the window, so the true peak inside it wins instead. Sub-pixel via a
-    parabolic fit. Returns (dy, dx) in the same convention as register_pcc."""
+    parabolic fit.
+
+    Returns (dy, dx, peak_ratio, peak_z) -- the shift PLUS two PEAK-DOMINANCE scores
+    measured on the constrained correlation surface, so the caller can separate a
+    unique, sharp registration from an ambiguous one. A bright-but-textureless box
+    (smooth glow / pure noise) yields a flat surface with no dominant peak:
+      * peak_ratio = winning peak / next-highest peak OUTSIDE a +-excl_px neighbourhood
+        (both taken inside the plausible window). ~1 => ambiguous, >1 => dominant.
+      * peak_z     = (peak - mean) / std over the windowed surface (peak-to-sidelobe)."""
     a, b = _pcc_prep(strip_a, strip_b, highpass_sigma, window)
     A = np.fft.fft2(a); B = np.fft.fft2(b)
     R = A * np.conj(B); R /= np.abs(R) + 1e-12
@@ -115,12 +127,22 @@ def register_pcc_constrained(strip_a, strip_b, highpass_sigma, window,
     else:
         oky = (dY >= join_center - join_half) & (dY <= join_center + join_half)
         okx = np.abs(dX) <= max_cross
-    masked = np.where(np.outer(oky, okx), corr, -np.inf)
+    ok = np.outer(oky, okx)
+    masked = np.where(ok, corr, -np.inf)
     py, px = np.unravel_index(np.argmax(masked), masked.shape)
     dyf, dxf = _parabolic_subpx(corr, py, px)
     dy = (py - h if py > h // 2 else py) + dyf
     dx = (px - w if px > w // 2 else px) + dxf
-    return float(dy), float(dx)
+    # -- peak dominance: is the winning peak unique and sharp? ----------
+    pk = corr[py, px]
+    vals = corr[ok]
+    peak_z = float((pk - vals.mean()) / (vals.std() + 1e-12))
+    yy = (np.arange(h) - py + h // 2) % h - h // 2   # circular distance to the peak
+    xx = (np.arange(w) - px + w // 2) % w - w // 2
+    excl = (np.abs(yy)[:, None] <= excl_px) & (np.abs(xx)[None, :] <= excl_px)
+    second = np.where(ok & ~excl, corr, -np.inf).max()
+    peak_ratio = float(pk / second) if second > 1e-9 else float('inf')
+    return float(dy), float(dx), peak_ratio, peak_z
 
 
 def edge_focus_box(strip_a, strip_b, thresh, pad_px, axis=0, min_frac=0.02, min_lines=32):
@@ -168,6 +190,15 @@ def enough_signal(strip_a, strip_b, thresh, min_signal_frac):
     return (frac_a >= min_signal_frac and frac_b >= min_signal_frac), frac_a, frac_b
 
 
+def peak_is_dominant(peak_ratio, peak_z, min_peak_ratio, min_peak_z):
+    """The NEW signal gate. Trust a seam's PCC shift only when its correlation peak is
+    DOMINANT: it clearly beats the next-best peak (peak_ratio) AND stands out of the
+    surrounding surface (peak_z). Replaces the old brightness-fraction gate
+    (`enough_signal`), which a bright-but-textureless box (smooth glow / noise) passes
+    even though it carries no registrable structure and gives a flat, ambiguous peak."""
+    return (peak_ratio >= min_peak_ratio) and (peak_z >= min_peak_z)
+
+
 def sinusoid_ramp(n, feather):
     """Length-n weight: 1 in the interior, a raised-cosine ease from ~0 to 1 over
     `feather` px at each end -> a smooth sinusoidal cross-fade across overlaps."""
@@ -212,14 +243,21 @@ def composite(placements, feather_axis, feather_px):
 # -- Registration + line compositing -------------------------------
 
 def register_row(tiles, overlap_frac, thresh, pad_px, upsample, highpass_sigma,
-                 max_cross, join_band_frac, min_signal_frac, label=''):
+                 max_cross, join_band_frac, min_signal_frac,
+                 min_peak_ratio, min_peak_z, label=''):
     """Register a row of tiles left->right with the basic_horizontal engine, but
     with CONSTRAINED-SEARCH PCC: the peak is taken within |dy| <= max_cross and dx
     within +-join_band_frac x overlap, so a spurious diagonal-slide peak can't win.
     (`upsample` is unused here; the constrained search uses a parabolic sub-pixel
-    fit.) When less than `min_signal_frac` of EITHER overlap strip is signal
-    (foreground > thresh) there is too little tissue to trust PCC, so that seam
-    skips registration and falls back to the nominal overlap (dy=dx=0). Returns
+    fit.)
+
+    A seam's measured shift is trusted only when it clears TWO gates: the overlap
+    strips carry enough signal (>= min_signal_frac foreground in each) AND the
+    constrained correlation peak is DOMINANT (peak_ratio >= min_peak_ratio and
+    peak_z >= min_peak_z). The peak-dominance gate is the NEW check -- it rejects a
+    bright-but-textureless box (smooth glow / pure noise) whose flat correlation
+    surface gives a meaningless "shift" even though it passes the brightness test.
+    A seam failing either gate falls back to the nominal overlap (dy=dx=0). Returns
     [(dy, dx, overlap), ...]."""
     shifts = []
     for i in range(1, len(tiles)):
@@ -234,12 +272,19 @@ def register_row(tiles, overlap_frac, thresh, pad_px, upsample, highpass_sigma,
                   f'PCC, using nominal overlap (dy=dx=0)')
             continue
         r0, r1 = edge_focus_box(sa, sb, thresh, pad_px, axis=0)
-        dy, dx = register_pcc_constrained(sa[r0:r1], sb[r0:r1], highpass_sigma, True,
-                                          max_cross, 0, int(round(join_band_frac * overlap)), 'h')
+        dy, dx, pr, pz = register_pcc_constrained(
+            sa[r0:r1], sb[r0:r1], highpass_sigma, True,
+            max_cross, 0, int(round(join_band_frac * overlap)), 'h')
+        if not peak_is_dominant(pr, pz, min_peak_ratio, min_peak_z):
+            shifts.append((0.0, 0.0, overlap))
+            print(f'  {label}: pair {i-1}-{i}  overlap={overlap}px  box rows {r0}-{r1}  '
+                  f'peak_ratio={pr:.3f} < {min_peak_ratio} (peak_z={pz:.1f})  -> peak NOT '
+                  f'dominant (smooth/noise, no registrable texture), using nominal overlap (dy=dx=0)')
+            continue
         shifts.append((dy, dx, overlap))
         hug = ('  [hugs top]' if r0 == 0 else '') + ('  [hugs bottom]' if r1 == sa.shape[0] else '')
         print(f'  {label}: pair {i-1}-{i}  overlap={overlap}px  box rows {r0}-{r1} '
-              f'({r1-r0}px tall){hug}  dy={dy:+.2f} dx={dx:+.2f}')
+              f'({r1-r0}px tall){hug}  dy={dy:+.2f} dx={dx:+.2f}  peak_ratio={pr:.3f} peak_z={pz:.1f}')
     return shifts
 
 
@@ -265,8 +310,8 @@ def register_column(rows, overlap_frac, thresh, pad_px, upsample, highpass_sigma
                   f'PCC, using nominal overlap (dy=dx=0)')
             continue
         c0, c1 = edge_focus_box(sa, sb, thresh, pad_px, axis=1)
-        dy, dx = register_pcc_constrained(sa[:, c0:c1], sb[:, c0:c1], highpass_sigma, True,
-                                          max_cross, 0, int(round(join_band_frac * overlap)), 'v')
+        dy, dx, _, _ = register_pcc_constrained(sa[:, c0:c1], sb[:, c0:c1], highpass_sigma, True,
+                                                max_cross, 0, int(round(join_band_frac * overlap)), 'v')
         shifts.append((dy, dx, overlap))
         w = min(sa.shape[1], sb.shape[1])
         hug = ('  [hugs left]' if c0 == 0 else '') + ('  [hugs right]' if c1 == w else '')
@@ -370,8 +415,9 @@ def compute_shifts(ref_grid, thresh, p):
             print('  single tile - nothing to register')
         else:
             shifts = register_row(tiles, p.overlap_frac_h, thresh, p.edge_pad_px,
-                                  p.upsample, p.highpass_sigma, p.max_cross_px,
-                                  p.join_band_frac, p.min_signal_frac, label=f'row {r}')
+                                  p.upsample, p.highpass_sigma, p.max_cross_px_h,
+                                  p.join_band_frac, p.min_signal_frac,
+                                  p.min_peak_ratio, p.min_peak_z, label=f'row {r}')
         row_shifts.append(shifts)
         rows_reg.append(composite_line(tiles, shifts, 'h', p.overlap_frac_h, register=True))
 
@@ -381,7 +427,7 @@ def compute_shifts(ref_grid, thresh, p):
     else:
         print('\nRegistering rows top -> bottom (edge-focus box on columns + constrained PCC):')
         v_shifts = register_column(rows_reg, p.overlap_frac_v, thresh, p.edge_pad_px,
-                                   p.upsample, p.highpass_sigma, p.max_cross_px,
+                                   p.upsample, p.highpass_sigma, p.max_cross_px_v,
                                    p.join_band_frac, p.min_signal_frac, label='rows')
     return row_shifts, v_shifts
 
@@ -414,7 +460,7 @@ def parse_args():
     ap.add_argument('input_dir',
                     help='Folder of tiles named <stem>[<r> x <c>]_C<ch>_z<z>.ome.tif')
     ap.add_argument('--output-dir', default=None,
-                    help='Where the "Channel <ch> stitched" folders go '
+                    help='Where the "Channel_<ch>_stitched" folders go '
                          '(default: the input folder)')
     ap.add_argument('--reference-channel', type=int, default=0,
                     help='Channel used to compute the shifts (default: 0)')
@@ -431,15 +477,28 @@ def parse_args():
                     help='(Unused; constrained search uses a parabolic sub-pixel fit)')
     ap.add_argument('--highpass-sigma', type=float, default=12,
                     help='Gaussian sigma for the high-pass prefilter (default: 12)')
-    ap.add_argument('--max-cross-px', type=int, default=20,
-                    help='Max plausible cross-axis shift, px (default: 20)')
+    ap.add_argument('--max-cross-px-h', type=int, default=20,
+                    help='Max plausible cross-axis shift for HORIZONTAL tile seams, '
+                         'px (|dy|; default: 20)')
+    ap.add_argument('--max-cross-px-v', type=int, default=100,
+                    help='Max plausible cross-axis shift for VERTICAL row seams, px '
+                         '(|dx|; whole rows can drift left<->right a lot, default: 100)')
     ap.add_argument('--join-band-frac', type=float, default=1.0,
                     help='Join-axis search half-width, fraction of overlap (default: 1.0)')
-    ap.add_argument('--min-signal-frac', type=float, default=0.05,
+    ap.add_argument('--min-signal-frac', type=float, default=0.0001,
                     help='Minimum fraction of each overlap strip that must be signal '
                          '(foreground > tissue threshold) to register with PCC. If '
                          'either strip has less, skip PCC and default to the nominal '
-                         'assumed overlap, dy=dx=0 (default: 0.05)')
+                         'assumed overlap, dy=dx=0 (default: 0.0001)')
+    ap.add_argument('--min-peak-ratio', type=float, default=1.10,
+                    help='HORIZONTAL stage only: minimum peak/2nd-peak ratio for the '
+                         'constrained correlation peak to count as dominant (a unique, '
+                         'sharp registration). Below it the seam is treated as textureless '
+                         '(smooth glow / noise) and falls back to the nominal overlap, '
+                         'dy=dx=0 (default: 1.10)')
+    ap.add_argument('--min-peak-z', type=float, default=0.0,
+                    help='HORIZONTAL stage only: minimum peak-to-sidelobe z-score for the '
+                         'peak-dominance gate (secondary; 0.0 = off by default)')
     ap.add_argument('--z-slices', default=None,
                     help='Comma-separated z-slices to process (default: all detected)')
     return ap.parse_args()
@@ -451,7 +510,8 @@ def main():
     out_root = Path(p.output_dir) if p.output_dir else input_dir
 
     stem, n_rows, n_cols, channels, z_slices, index = scan_input_folder(input_dir)
-    in_dtype = tifffile.imread(str(next(iter(index.values())))).dtype  # match on save
+    in_dtype = tifffile.imread(str(next(iter(index.values()))),
+                               is_ome=False).dtype  # match on save (one plane only)
     if p.z_slices:
         wanted = {int(z) for z in p.z_slices.split(',')}
         z_slices = [z for z in z_slices if z in wanted]
@@ -466,8 +526,9 @@ def main():
     print(f'Z-slices     : {z_slices}')
     print(f'Output root  : {out_root}')
 
-    # One output folder per channel.
-    out_dirs = {ch: out_root / f'Channel {ch} stitched' for ch in channels}
+    # One output folder per channel. Names carry no spaces so the paths stay easy
+    # to pass around on a command line / cluster without quoting.
+    out_dirs = {ch: out_root / f'Channel_{ch}_stitched' for ch in channels}
     for d in out_dirs.values():
         d.mkdir(parents=True, exist_ok=True)
 
